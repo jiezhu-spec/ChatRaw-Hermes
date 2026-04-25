@@ -1,0 +1,40 @@
+{
+  "id": "context-compressor",
+  "version": "1.0.0",
+  "name": {
+    "en": "Context Compressor",
+    "zh": "上下文压缩"
+  },
+  "description": {
+    "en": "Automatically compacts older chat context and provides a manual toolbar compaction button.",
+    "zh": "自动压缩较早的聊天上下文，并提供工具栏手动压缩按钮。"
+  },
+  "author": "ChatRaw",
+  "homepage": "https://github.com/massif-01/ChatRaw",
+  "icon": "icon.png",
+  "main": "main.js",
+  "type": "message_processor",
+  "hooks": ["plugin_load"],
+  "settings": [
+    {
+      "id": "autoCompress",
+      "type": "boolean",
+      "default": true,
+      "label": {
+        "en": "Auto Compress",
+        "zh": "自动压缩"
+      }
+    },
+    {
+      "id": "thresholdPercent",
+      "type": "number",
+      "default": 70,
+      "min": 30,
+      "max": 95,
+      "label": {
+        "en": "Auto Compression Threshold (%)",
+        "zh": "自动压缩阈值 (%)"
+      }
+    }
+  ]
+}
