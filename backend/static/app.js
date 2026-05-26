@@ -2165,25 +2165,32 @@ function app() {
             
             this.pluginMarketLoading = true;
             this.pluginMarketError = false;
+            let timeout = null;
             
             try {
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 5000);
+                timeout = setTimeout(() => controller.abort(), 5000);
                 
                 const res = await fetch(
                     'https://raw.githubusercontent.com/massif-01/ChatRaw/main/Plugins/Plugin_market/index.json',
                     { signal: controller.signal }
                 );
                 clearTimeout(timeout);
+                timeout = null;
                 
                 if (!res.ok) throw new Error('Failed to fetch');
                 
                 const data = await res.json();
                 this.marketPlugins = data.plugins || [];
             } catch (e) {
-                console.error('Failed to load plugin market:', e);
+                if (e.name === 'AbortError') {
+                    console.warn('Plugin market request timed out');
+                } else {
+                    console.error('Failed to load plugin market:', e);
+                }
                 this.pluginMarketError = true;
             } finally {
+                if (timeout) clearTimeout(timeout);
                 this.pluginMarketLoading = false;
             }
         },

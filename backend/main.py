@@ -14,7 +14,7 @@ import struct
 import logging
 import shutil
 from datetime import datetime
-from typing import Optional, List, AsyncGenerator
+from typing import Optional, List, AsyncGenerator, Dict, Any
 from contextlib import asynccontextmanager
 
 # ============ Structured Logging Setup ============
@@ -92,6 +92,8 @@ import sqlite3
 import math
 from collections import defaultdict
 import time as time_module
+
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Document parsing
 try:
@@ -261,6 +263,17 @@ class Database:
                 content TEXT NOT NULL,
                 created_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS chat_compactions (
+                chat_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                boundary_message_id TEXT NOT NULL,
+                boundary_created_at TEXT NOT NULL,
+                original_token_estimate INTEGER DEFAULT 0,
+                summary_token_estimate INTEGER DEFAULT 0,
+                compressed_message_count INTEGER DEFAULT 0,
+                updated_at TEXT
+            );
             
             CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY,
@@ -279,6 +292,7 @@ class Database:
             
             -- Indexes for faster queries
             CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_compactions_updated ON chat_compactions(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id);
             CREATE INDEX IF NOT EXISTS idx_chats_updated ON chats(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_model_type ON model_configs(type);
@@ -444,16 +458,15 @@ class Database:
         conn = self.get_conn()
         cursor = conn.cursor()
         # Cleanup old chats and their messages
-        cursor.execute("""
-            DELETE FROM messages WHERE chat_id IN (
-                SELECT id FROM chats ORDER BY updated_at DESC LIMIT -1 OFFSET 9
-            )
-        """)
-        cursor.execute("""
-            DELETE FROM chats WHERE id IN (
-                SELECT id FROM chats ORDER BY updated_at DESC LIMIT -1 OFFSET 9
-            )
-        """)
+        cursor.execute("SELECT id FROM chats ORDER BY updated_at DESC LIMIT -1 OFFSET 9")
+        stale_chat_ids = [row["id"] for row in cursor.fetchall()]
+        if stale_chat_ids:
+            stale_chats_subquery = "SELECT id FROM chats ORDER BY updated_at DESC LIMIT -1 OFFSET 9"
+            cursor.execute(f"DELETE FROM chat_compactions WHERE chat_id IN ({stale_chats_subquery})")
+            cursor.execute(f"DELETE FROM messages WHERE chat_id IN ({stale_chats_subquery})")
+            cursor.execute(f"DELETE FROM chats WHERE id IN ({stale_chats_subquery})")
+            for stale_chat_id in stale_chat_ids:
+                _context_compaction_locks.pop(stale_chat_id, None)
         
         chat_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
@@ -473,9 +486,11 @@ class Database:
     def delete_chat(self, chat_id: str):
         conn = self.get_conn()
         cursor = conn.cursor()
+        cursor.execute("DELETE FROM chat_compactions WHERE chat_id = ?", (chat_id,))
         cursor.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
         cursor.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
         conn.commit()
+        _context_compaction_locks.pop(chat_id, None)
     
     # Messages
     def get_messages(self, chat_id: str) -> List[Message]:
@@ -503,6 +518,60 @@ class Database:
         conn.commit()
         
         return Message(id=msg_id, chat_id=chat_id, role=role, content=content, created_at=now)
+
+    # Context compaction
+    def get_chat_compaction(self, chat_id: str) -> Optional[dict]:
+        cursor = self.get_conn().cursor()
+        cursor.execute("SELECT * FROM chat_compactions WHERE chat_id = ?", (chat_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def save_chat_compaction(
+        self,
+        chat_id: str,
+        summary: str,
+        boundary_message: Message,
+        original_token_estimate: int,
+        summary_token_estimate: int,
+        compressed_message_count: int,
+    ) -> dict:
+        updated_at = datetime.now().isoformat()
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO chat_compactions
+                (chat_id, summary, boundary_message_id, boundary_created_at,
+                 original_token_estimate, summary_token_estimate, compressed_message_count, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                summary = excluded.summary,
+                boundary_message_id = excluded.boundary_message_id,
+                boundary_created_at = excluded.boundary_created_at,
+                original_token_estimate = excluded.original_token_estimate,
+                summary_token_estimate = excluded.summary_token_estimate,
+                compressed_message_count = excluded.compressed_message_count,
+                updated_at = excluded.updated_at
+        """, (
+            chat_id,
+            summary,
+            boundary_message.id,
+            boundary_message.created_at,
+            original_token_estimate,
+            summary_token_estimate,
+            compressed_message_count,
+            updated_at,
+        ))
+        conn.commit()
+        return {
+            "chat_id": chat_id,
+            "summary": summary,
+            "boundary_message_id": boundary_message.id,
+            "boundary_created_at": boundary_message.created_at,
+            "original_token_estimate": original_token_estimate,
+            "summary_token_estimate": summary_token_estimate,
+            "compressed_message_count": compressed_message_count,
+            "updated_at": updated_at,
+        }
     
     # Documents
     def get_documents(self):
@@ -566,11 +635,447 @@ class Database:
         cursor.execute("SELECT COUNT(*) FROM document_chunks WHERE embedding IS NOT NULL")
         return cursor.fetchone()[0]
 
+CONTEXT_COMPRESSOR_PLUGIN_ID = "context-compressor"
+CONTEXT_COMPRESSOR_KEEP_MESSAGES = 6
+CONTEXT_COMPRESSOR_DEFAULT_THRESHOLD = 70
+CONTEXT_COMPRESSOR_MIN_THRESHOLD = 30
+CONTEXT_COMPRESSOR_MAX_THRESHOLD = 95
+CONTEXT_COMPRESSOR_SUMMARY_MAX_TOKENS = 1024
+CONTEXT_COMPRESSOR_RESERVED_PROMPT_TOKENS = 512
+CONTEXT_COMPRESSOR_MIN_BATCH_TOKENS = 512
+CONTEXT_COMPRESSOR_MIN_CANDIDATE_TOKENS = 64
+
+_context_compaction_locks: Dict[str, asyncio.Lock] = {}
+
+
+class ContextCompactionUnavailable(RuntimeError):
+    """Raised when compaction cannot produce a usable summary but chat can continue."""
+
+
+def clamp_context_threshold(value: Any) -> int:
+    try:
+        threshold = int(value)
+    except (TypeError, ValueError):
+        threshold = CONTEXT_COMPRESSOR_DEFAULT_THRESHOLD
+    return max(CONTEXT_COMPRESSOR_MIN_THRESHOLD, min(CONTEXT_COMPRESSOR_MAX_THRESHOLD, threshold))
+
+
+def estimate_text_tokens(text: Any) -> int:
+    """Lightweight token estimate without tokenizer dependencies."""
+    if text is None:
+        return 0
+    if not isinstance(text, str):
+        text = json.dumps(text, ensure_ascii=False)
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    non_ascii_chars = len(text) - ascii_chars
+    return max(1, math.ceil(ascii_chars / 4 + non_ascii_chars / 2))
+
+
+def estimate_messages_tokens(messages: List[dict]) -> int:
+    total = 2
+    for message in messages:
+        total += 4
+        total += estimate_text_tokens(message.get("role", ""))
+        content = message.get("content", "")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    total += estimate_text_tokens(item.get("text") or item.get("image_url") or "")
+                else:
+                    total += estimate_text_tokens(item)
+        else:
+            total += estimate_text_tokens(content)
+    return total
+
+
+def build_message_to_save(message: str, web_content: str = "", web_url: str = "") -> str:
+    if not web_content:
+        return message
+    web_context = f"以下是用户提供的网页/文档内容作为参考 (来源: {web_url or '附件'}):\n---\n{web_content}\n---\n\n"
+    return f"{web_context}{message}"
+
+
+def get_chat_lock(chat_id: str) -> asyncio.Lock:
+    lock = _context_compaction_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _context_compaction_locks[chat_id] = lock
+    return lock
+
+
+def extract_openai_message_text(message: Any) -> str:
+    """Normalize OpenAI-style chat completion `message` to plain text.
+    Handles string content, multimodal `content` arrays, and empty `content`
+    with text only in `reasoning_content` / `thinking` (some providers)."""
+    if not message or not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and part.get("text"):
+                parts.append(str(part["text"]))
+            elif "text" in part and part.get("text"):
+                parts.append(str(part["text"]))
+        if parts:
+            return "\n".join(parts).strip()
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        val = message.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
 # ============ LLM Service ============
 
 class LLMService:
     def __init__(self, db: Database):
         self.db = db
+
+    def _get_input_budget(self, config: ModelConfig) -> int:
+        context_length = int(config.context_length or 0)
+        max_output = int(config.max_output or 0)
+        budget = context_length - max_output
+        if budget <= 0:
+            raise ValueError("Invalid context configuration: context length must be greater than max output")
+        return budget
+
+    def _get_summary_max_tokens(self, config: ModelConfig) -> int:
+        # 1024 is the default summary target; max_output is the configured safety ceiling.
+        return max(1, min(CONTEXT_COMPRESSOR_SUMMARY_MAX_TOKENS, int(config.max_output or 1)))
+
+    def _find_boundary_index(self, history: List[Message], compaction: Optional[dict]) -> Optional[int]:
+        if not compaction:
+            return None
+        boundary_id = compaction.get("boundary_message_id")
+        for idx, message in enumerate(history):
+            if message.id == boundary_id:
+                if compaction.get("boundary_created_at") != message.created_at:
+                    logger.warning(f"Compaction boundary timestamp mismatch for chat {message.chat_id}")
+                return idx
+        return None
+
+    def _raw_history_messages(self, history: List[Message]) -> List[dict]:
+        return [{"role": message.role, "content": message.content} for message in history]
+
+    def build_history_messages(
+        self,
+        chat_id: str,
+        use_compaction: bool = True,
+        system_prompt: str = "",
+    ) -> List[dict]:
+        history = self.db.get_messages(chat_id)
+        messages = []
+        system_prompt = system_prompt.strip()
+        if not use_compaction:
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            return messages + self._raw_history_messages(history)
+
+        compaction = self.db.get_chat_compaction(chat_id)
+        boundary_index = self._find_boundary_index(history, compaction)
+        summary = (compaction or {}).get("summary", "").strip()
+        if boundary_index is None or not summary:
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            return messages + self._raw_history_messages(history)
+
+        summary_prompt = (
+            "Earlier conversation context has been compressed. Use this summary as durable context, "
+            "then continue from the following recent messages.\n\n"
+            f"{summary}"
+        )
+        system_parts = [part for part in [system_prompt, summary_prompt] if part]
+        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
+        return messages + self._raw_history_messages(history[boundary_index + 1:])
+
+    def _truncate_to_token_budget(self, text: str, token_budget: int) -> str:
+        if estimate_text_tokens(text) <= token_budget:
+            return text
+        suffix = "\n[Content truncated for context summary]"
+        available_budget = max(1, token_budget - estimate_text_tokens(suffix))
+        ratio = max(0.05, available_budget / max(1, estimate_text_tokens(text)))
+        target_len = max(1, int(len(text) * ratio))
+        truncated = text[:target_len]
+        while len(truncated) > 1 and estimate_text_tokens(truncated) > available_budget:
+            truncated = truncated[:max(1, int(len(truncated) * 0.8))]
+        return truncated + suffix
+
+    def _format_message_for_summary(self, message: Message, token_budget: int) -> str:
+        content = self._truncate_to_token_budget(message.content, max(64, token_budget))
+        return f"{message.role.upper()} [{message.created_at}]\n{content}"
+
+    def _format_summary_batch(self, messages: List[Message], batch_budget: int) -> str:
+        if not messages:
+            return ""
+        per_message_budget = max(128, batch_budget // max(1, len(messages)))
+        return "\n\n---\n\n".join(
+            self._format_message_for_summary(message, per_message_budget)
+            for message in messages
+        )
+
+    def _split_summary_batches(self, messages: List[Message], batch_budget: int) -> List[List[Message]]:
+        batches = []
+        current = []
+        current_tokens = 0
+        for message in messages:
+            message_tokens = min(estimate_text_tokens(message.content) + 8, batch_budget)
+            if current and current_tokens + message_tokens > batch_budget:
+                batches.append(current)
+                current = []
+                current_tokens = 0
+            current.append(message)
+            current_tokens += message_tokens
+        if current:
+            batches.append(current)
+        return batches
+
+    def _summary_prompt_messages(
+        self,
+        existing_summary: str,
+        batch_messages: List[Message],
+        batch_budget: int,
+    ) -> List[dict]:
+        prior_summary = existing_summary.strip() or "No prior summary."
+        batch_text = self._format_summary_batch(batch_messages, batch_budget)
+        system_prompt = (
+            "You compact older chat history for a continuing AI conversation. "
+            "Write in the conversation's dominant language. Preserve user goals, important decisions, "
+            "constraints, named files or code references, unresolved tasks, and facts needed for future turns. "
+            "Remove small talk and duplicated wording. Return only a structured concise summary."
+        )
+        user_prompt = (
+            "Existing summary:\n"
+            f"{prior_summary}\n\n"
+            "Additional older messages to merge into the summary:\n"
+            f"{batch_text}\n\n"
+            "Produce the updated compact summary."
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    async def _call_chat_completion_raw(
+        self,
+        config: ModelConfig,
+        messages: List[dict],
+        max_tokens: int,
+        temperature: float = 0.2,
+    ) -> str:
+        url = config.api_url.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if config.api_key:
+            headers["Authorization"] = f"Bearer {config.api_key}"
+
+        settings = self.db.get_settings()
+        payload = {
+            "model": config.model_id,
+            "messages": messages,
+            "temperature": temperature,
+            "top_p": settings.chat_settings.top_p,
+            "max_tokens": max_tokens,
+            "stream": False
+        }
+
+        session = await get_http_session()
+        async with session.post(url, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                raise RuntimeError(f"Summary API error ({resp.status}): {error_text[:500]}")
+            data = await resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                raise ContextCompactionUnavailable("Summary model returned no choices")
+            choice0 = choices[0] if isinstance(choices[0], dict) else {}
+            msg = choice0.get("message") or {}
+            text = extract_openai_message_text(msg)
+            if not text:
+                fr = choice0.get("finish_reason")
+                logger.warning(
+                    "Summary completion empty content; message keys=%s finish_reason=%r",
+                    list(msg.keys()) if isinstance(msg, dict) else type(msg),
+                    fr,
+                )
+                raise ContextCompactionUnavailable(
+                    "Summary model returned empty content; no context was compressed"
+                )
+            return text
+
+    async def _summarize_messages(
+        self,
+        existing_summary: str,
+        candidate_messages: List[Message],
+        config: ModelConfig,
+    ) -> str:
+        input_budget = self._get_input_budget(config)
+        summary = existing_summary.strip()
+        remaining_messages = list(candidate_messages)
+        while remaining_messages:
+            summary_tokens = estimate_text_tokens(summary) if summary else estimate_text_tokens("No prior summary.")
+            batch_budget = input_budget - CONTEXT_COMPRESSOR_RESERVED_PROMPT_TOKENS - summary_tokens
+            if batch_budget < CONTEXT_COMPRESSOR_MIN_BATCH_TOKENS:
+                raise RuntimeError("Context window is too small for summary generation with existing summary")
+
+            batch = self._split_summary_batches(remaining_messages, batch_budget)[0]
+            prompt_messages = self._summary_prompt_messages(summary, batch, batch_budget)
+            prompt_tokens = estimate_messages_tokens(prompt_messages)
+            while prompt_tokens > input_budget and batch_budget > 64:
+                batch_budget = max(64, int(batch_budget * 0.8))
+                prompt_messages = self._summary_prompt_messages(summary, batch, batch_budget)
+                prompt_tokens = estimate_messages_tokens(prompt_messages)
+            if prompt_tokens > input_budget:
+                raise RuntimeError("Summary prompt exceeds model input budget")
+
+            summary = await self._call_chat_completion_raw(
+                config,
+                prompt_messages,
+                max_tokens=self._get_summary_max_tokens(config),
+                temperature=0.2,
+            )
+            if not summary:
+                raise ContextCompactionUnavailable("Summary model returned empty content; no context was compressed")
+            remaining_messages = remaining_messages[len(batch):]
+        return summary
+
+    async def compact_chat_history(self, chat_id: str) -> dict:
+        async with get_chat_lock(chat_id):
+            history = self.db.get_messages(chat_id)
+            if len(history) <= CONTEXT_COMPRESSOR_KEEP_MESSAGES:
+                return {"success": True, "compressed": False, "reason": "not_enough_history"}
+
+            keep_start = len(history) - CONTEXT_COMPRESSOR_KEEP_MESSAGES
+            compaction = self.db.get_chat_compaction(chat_id)
+            boundary_index = self._find_boundary_index(history, compaction)
+            existing_summary = ""
+            start_index = 0
+            if compaction and boundary_index is not None:
+                existing_summary = compaction.get("summary", "")
+                start_index = boundary_index + 1
+
+            candidate_messages = history[start_index:keep_start]
+            if not candidate_messages:
+                return {
+                    "success": True,
+                    "compressed": False,
+                    "reason": "already_compacted",
+                    "compressed_message_count": compaction.get("compressed_message_count", 0) if compaction else 0,
+                }
+
+            candidate_token_estimate = estimate_messages_tokens(
+                self._raw_history_messages(candidate_messages)
+            )
+            if candidate_token_estimate < CONTEXT_COMPRESSOR_MIN_CANDIDATE_TOKENS:
+                return {
+                    "success": True,
+                    "compressed": False,
+                    "reason": "candidates_too_short",
+                    "candidate_token_estimate": candidate_token_estimate,
+                    "compressed_message_count": compaction.get("compressed_message_count", 0) if compaction else 0,
+                }
+
+            config = self.db.get_model_by_type("chat")
+            if not config or not config.api_url or not config.model_id:
+                raise RuntimeError("Chat model not configured")
+            self._get_input_budget(config)
+
+            try:
+                summary = await self._summarize_messages(existing_summary, candidate_messages, config)
+            except ContextCompactionUnavailable as e:
+                logger.warning(f"Context compaction skipped for chat {chat_id}: {e}")
+                return {
+                    "success": True,
+                    "compressed": False,
+                    "reason": "summary_unavailable",
+                    "message": str(e),
+                    "compressed_message_count": compaction.get("compressed_message_count", 0) if compaction else 0,
+                }
+
+            boundary_message = history[keep_start - 1]
+            original_messages = history[:keep_start]
+            original_token_estimate = estimate_messages_tokens(self._raw_history_messages(original_messages))
+            summary_token_estimate = estimate_text_tokens(summary)
+
+            if summary_token_estimate >= original_token_estimate and not existing_summary:
+                logger.info(
+                    "Compaction discarded: summary (%d tokens) >= original (%d tokens) for chat %s",
+                    summary_token_estimate, original_token_estimate, chat_id,
+                )
+                return {
+                    "success": True,
+                    "compressed": False,
+                    "reason": "summary_not_shorter",
+                    "original_token_estimate": original_token_estimate,
+                    "summary_token_estimate": summary_token_estimate,
+                }
+
+            compressed_message_count = keep_start
+
+            record = self.db.save_chat_compaction(
+                chat_id,
+                summary,
+                boundary_message,
+                original_token_estimate,
+                summary_token_estimate,
+                compressed_message_count,
+            )
+            return {
+                "success": True,
+                "compressed": True,
+                "compressed_message_count": record["compressed_message_count"],
+                "original_token_estimate": record["original_token_estimate"],
+                "summary_token_estimate": record["summary_token_estimate"],
+                "saved_tokens": max(0, record["original_token_estimate"] - record["summary_token_estimate"]),
+            }
+
+    async def maybe_auto_compact(
+        self,
+        chat_id: str,
+        current_user_content: str,
+        threshold_percent: int,
+        system_prompt: str = "",
+    ) -> dict:
+        config = self.db.get_model_by_type("chat")
+        if not config or not config.api_url or not config.model_id:
+            return {"success": True, "compressed": False, "reason": "model_not_configured"}
+
+        try:
+            input_budget = self._get_input_budget(config)
+        except ValueError as e:
+            return {"success": False, "error": str(e), "reason": "invalid_context_configuration"}
+
+        base_messages = self.build_history_messages(chat_id, use_compaction=True, system_prompt=system_prompt)
+        base_messages.append({"role": "user", "content": current_user_content})
+
+        estimated_tokens = estimate_messages_tokens(base_messages)
+        threshold_tokens = math.floor(input_budget * clamp_context_threshold(threshold_percent) / 100)
+        if estimated_tokens < threshold_tokens:
+            return {"success": True, "compressed": False, "reason": "below_threshold"}
+
+        hard_exceeded = estimated_tokens >= input_budget
+        try:
+            result = await self.compact_chat_history(chat_id)
+        except Exception as e:
+            if hard_exceeded:
+                return {"success": False, "error": str(e), "hard_exceeded": True}
+            logger.warning(f"Auto context compaction skipped for chat {chat_id}: {e}")
+            return {"success": True, "compressed": False, "reason": "auto_compaction_failed"}
+
+        if hard_exceeded:
+            post_messages = self.build_history_messages(chat_id, use_compaction=True, system_prompt=system_prompt)
+            post_messages.append({"role": "user", "content": current_user_content})
+            if estimate_messages_tokens(post_messages) >= input_budget:
+                return {
+                    "success": False,
+                    "error": "Context exceeds model limit and could not be compacted enough",
+                    "hard_exceeded": True,
+                }
+
+        return result
     
     async def chat_stream(self, chat_id: str, message: str, use_rag: bool = False, use_thinking: bool = False, image_base64: str = "", web_content: str = "", web_url: str = "") -> AsyncGenerator[str, None]:
         """Stream chat responses with optional thinking/reasoning support"""
@@ -581,16 +1086,12 @@ class LLMService:
         
         settings = self.db.get_settings()
         
-        # Build messages
-        history = self.db.get_messages(chat_id)
-        messages = []
-        
-        # Add system prompt if configured
-        if settings.chat_settings.system_prompt:
-            messages.append({"role": "system", "content": settings.chat_settings.system_prompt})
-        
-        # Add conversation history
-        messages.extend([{"role": m.role, "content": m.content} for m in history])
+        compressor_config = get_context_compressor_config()
+        messages = self.build_history_messages(
+            chat_id,
+            use_compaction=compressor_config["enabled"],
+            system_prompt=settings.chat_settings.system_prompt,
+        )
         
         # RAG context and references
         rag_context = ""
@@ -717,15 +1218,12 @@ class LLMService:
         
         settings = self.db.get_settings()
         
-        history = self.db.get_messages(chat_id)
-        messages = []
-        
-        # Add system prompt if configured
-        if settings.chat_settings.system_prompt:
-            messages.append({"role": "system", "content": settings.chat_settings.system_prompt})
-        
-        # Add conversation history
-        messages.extend([{"role": m.role, "content": m.content} for m in history])
+        compressor_config = get_context_compressor_config()
+        messages = self.build_history_messages(
+            chat_id,
+            use_compaction=compressor_config["enabled"],
+            system_prompt=settings.chat_settings.system_prompt,
+        )
         
         # RAG context and references
         rag_context = ""
@@ -1315,6 +1813,24 @@ async def get_messages(chat_id: str):
     messages = db.get_messages(chat_id)
     return [m.model_dump() for m in messages]
 
+@app.post("/api/chats/{chat_id}/compact")
+async def compact_chat_context(chat_id: str):
+    compressor_config = get_context_compressor_config()
+    if not compressor_config["enabled"]:
+        return {
+            "success": True,
+            "compressed": False,
+            "disabled": True,
+            "message": "Context compressor plugin is disabled",
+        }
+
+    try:
+        result = await llm_service.compact_chat_history(chat_id)
+        return result
+    except Exception as e:
+        logger.exception("Manual context compaction failed for chat %s", chat_id)
+        return JSONResponse({"success": False, "error": str(e) or e.__class__.__name__}, status_code=500)
+
 @app.post("/api/chat")
 async def chat(request: Request):
     try:
@@ -1338,14 +1854,22 @@ async def chat(request: Request):
         chat_obj = db.create_chat("New Chat")
         chat_id = chat_obj.id
     
-    # Save user message (include web/document content so it persists for follow-up questions)
-    message_to_save = message
-    if web_content:
-        web_context = f"以下是用户提供的网页/文档内容作为参考 (来源: {web_url or '附件'}):\n---\n{web_content}\n---\n\n"
-        message_to_save = f"{web_context}{message}"
-    db.add_message(chat_id, "user", message_to_save)
-    
     settings = db.get_settings()
+
+    # Save user message after any automatic compaction decision so the current question is not summarized.
+    message_to_save = build_message_to_save(message, web_content, web_url)
+    compressor_config = get_context_compressor_config()
+    if compressor_config["enabled"] and compressor_config["auto_compress"]:
+        auto_result = await llm_service.maybe_auto_compact(
+            chat_id,
+            message_to_save,
+            compressor_config["threshold_percent"],
+            settings.chat_settings.system_prompt,
+        )
+        if not auto_result.get("success"):
+            return JSONResponse({"error": auto_result.get("error", "Context compaction failed")}, status_code=400)
+
+    db.add_message(chat_id, "user", message_to_save)
     
     if settings.chat_settings.stream:
         # Streaming response
@@ -1699,10 +2223,9 @@ os.makedirs(PLUGINS_INSTALLED_DIR, exist_ok=True)
 
 # Auto-install bundled plugins with lib/ directory (offline dependencies)
 # Resolve path: Docker has /app/Plugins, local dev has Plugins at project root (sibling of backend/)
-_backend_dir = os.path.dirname(os.path.abspath(__file__))
 _candidates = [
-    os.path.join(_backend_dir, "Plugins", "Plugin_market"),
-    os.path.abspath(os.path.join(_backend_dir, "..", "Plugins", "Plugin_market")),
+    os.path.join(BACKEND_DIR, "Plugins", "Plugin_market"),
+    os.path.abspath(os.path.join(BACKEND_DIR, "..", "Plugins", "Plugin_market")),
 ]
 BUNDLED_PLUGINS_DIR = next((p for p in _candidates if os.path.exists(p)), _candidates[0])
 
@@ -1766,6 +2289,19 @@ def load_plugin_config() -> dict:
             except Exception as e:
                 logger.error(f"Failed to load plugin config: {e}")
         return {"plugins": {}, "api_keys": {}}
+
+def get_context_compressor_config() -> dict:
+    """Read context compressor plugin state from the plugin config file."""
+    config = load_plugin_config()
+    plugin_config = config.get("plugins", {}).get(CONTEXT_COMPRESSOR_PLUGIN_ID, {})
+    plugin_dir = os.path.join(PLUGINS_INSTALLED_DIR, CONTEXT_COMPRESSOR_PLUGIN_ID)
+    enabled = bool(plugin_config.get("enabled", False)) and os.path.exists(plugin_dir)
+    settings = plugin_config.get("settings_values", {}) or {}
+    return {
+        "enabled": enabled,
+        "auto_compress": bool(settings.get("autoCompress", True)),
+        "threshold_percent": clamp_context_threshold(settings.get("thresholdPercent", CONTEXT_COMPRESSOR_DEFAULT_THRESHOLD)),
+    }
 
 def save_plugin_config(config: dict):
     """Save plugin configuration to file (thread-safe)"""
@@ -2558,7 +3094,7 @@ class CachedStaticFiles(StaticFiles):
 # Note: app.mount() creates a sub-application that bypasses main app middleware
 # So we wrap StaticFiles with GZipMiddleware directly
 from starlette.middleware.gzip import GZipMiddleware as StaticGZip
-static_app = CachedStaticFiles(directory="static", html=True)
+static_app = CachedStaticFiles(directory=os.path.join(BACKEND_DIR, "static"), html=True)
 gzipped_static_app = StaticGZip(static_app, minimum_size=500)
 app.mount("/", gzipped_static_app, name="static")
 
@@ -2567,4 +3103,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 51111))
     logger.info(f"ChatRaw starting on http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
-

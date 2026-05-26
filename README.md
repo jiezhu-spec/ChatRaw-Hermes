@@ -98,6 +98,7 @@ ChatRaw features a complete **plugin system** to extend functionality:
 - **Enhanced Web Parsing** — Parse web pages (browser / Firecrawl / Jina)
 - **Multi-Model Manager** — Manage and switch models
 - **Markdown Renderer Plus** — Math (KaTeX), Mermaid, code copy, offline
+- **Context Compressor** — Compact older chat history automatically or from the input toolbar
 - **Toolbar Extension Demo** — Demo plugin showcasing UI Extension API
 
 ### Toolbar Extension
@@ -284,6 +285,10 @@ In **Settings** → **Interface**, you can customize:
 3. Click **Install** on any plugin
 4. After installation, enable the plugin in the **Installed** tab
 
+For **Context Compressor**, enable the plugin to use compacted history in model requests. The
+`autoCompress` setting creates or updates summaries automatically; when it is off, existing summaries are
+still used and you can click the input toolbar compression button to compact manually.
+
 ---
 
 ## Use Cases
@@ -314,7 +319,7 @@ Contributions are welcome! Please submit issues or pull requests.
 
 MIT License
 
-© 2026 ChatRaw by massif-01, RMinte® AI Technology Co., Ltd.
+© 2026 ChatRaw by massif-01
 
 ---
 
@@ -409,6 +414,7 @@ ChatRaw 拥有完整的**插件系统**以扩展功能：
 - **增强网页解析** — 解析网页（浏览器 / Firecrawl / Jina）
 - **多模型管理** — 管理并切换模型
 - **Markdown 渲染增强** — 数学公式、Mermaid、代码复制，离线可用
+- **上下文压缩** — 自动或通过输入框工具栏压缩较早聊天历史
 - **工具栏扩展演示** — 展示 UI 扩展 API 的演示插件
 
 ### 工具栏扩展
@@ -590,6 +596,9 @@ python main.py
 3. 点击任意插件的**安装**按钮
 4. 安装后，在**已安装**标签页中启用插件
 
+对于**上下文压缩**插件，启用插件后模型请求会使用压缩后的历史摘要。`autoCompress` 会自动创建或更新摘要；
+关闭自动压缩后，已有摘要仍会继续使用，未创建摘要时则走完整历史，也可以点击输入框工具栏的压缩按钮手动压缩。
+
 ---
 
 ## 使用场景
@@ -620,7 +629,7 @@ python main.py
 
 MIT License
 
-© 2026 ChatRaw by massif-01, RMinte® AI Technology Co., Ltd.
+© 2026 ChatRaw by massif-01
 
 ---
 

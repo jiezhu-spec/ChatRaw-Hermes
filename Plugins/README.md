@@ -615,6 +615,23 @@ When a plugin is disabled or uninstalled:
 - All toolbar buttons registered by that plugin are automatically removed
 - If the plugin has an open fullscreen modal, it is automatically closed
 
+### Built-in Context Compressor
+
+The `context-compressor` plugin adds a manual compression button to the input toolbar and lets the backend
+automatically compact older chat history before model calls. It uses standard plugin settings:
+
+- `autoCompress` (`boolean`, default `true`): create or update compact summaries automatically when the
+  estimated input reaches the configured threshold.
+- `thresholdPercent` (`number`, default `70`, min `30`, max `95`): automatic compression threshold as a
+  percentage of the configured chat model input budget.
+
+When `autoCompress` is `false`, the plugin does not automatically create or update summaries. If a summary
+already exists, the backend still uses it while the plugin is enabled; if no summary exists, the chat uses full
+history until the user clicks the toolbar compression button. Disabling the plugin restores full history usage.
+
+The backend stores one latest summary per chat and never deletes or rewrites original messages. The summary only
+changes the model input assembled for future requests.
+
 #### Complete Example
 
 ```javascript
@@ -1779,6 +1796,17 @@ ChatRawPlugin.ui.closeFullscreenModal();
 当插件被禁用或卸载时：
 - 该插件注册的所有工具栏按钮会自动移除
 - 如果该插件打开了全屏模态框，会自动关闭
+
+### 内置上下文压缩插件
+
+`context-compressor` 插件会在输入框工具栏添加手动压缩按钮，并允许后端在模型调用前自动压缩较早聊天历史。它使用标准插件设置：
+
+- `autoCompress` (`boolean`，默认 `true`)：当估算输入达到阈值时自动创建或更新压缩摘要。
+- `thresholdPercent` (`number`，默认 `70`，最小 `30`，最大 `95`)：自动压缩阈值，占当前聊天模型输入预算的百分比。
+
+当 `autoCompress` 为 `false` 时，插件不会自动创建或更新摘要。如果已有摘要，插件启用期间后端仍会使用它；如果没有摘要，则会使用完整历史，直到用户点击工具栏压缩按钮。禁用插件会恢复完整历史。
+
+后端每个会话只保存最新摘要，不删除或改写原始消息。摘要只影响后续请求组装给模型的输入。
 
 #### 完整示例
 
