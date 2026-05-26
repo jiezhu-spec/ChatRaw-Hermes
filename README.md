@@ -319,7 +319,7 @@ Contributions are welcome! Please submit issues or pull requests.
 
 MIT License
 
-© 2026 ChatRaw by massif-01, RMinte® AI Technology Co., Ltd.
+© 2026 ChatRaw by massif-01
 
 ---
 
