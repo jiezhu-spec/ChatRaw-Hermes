@@ -204,6 +204,8 @@ The macOS app starts the local backend automatically and opens ChatRaw in a nati
 
 For local development:
 
+**Development requirements**: Xcode Command Line Tools or SwiftPM, plus Python 3.11+
+
 ```bash
 # Clone repository
 git clone https://github.com/massif-01/ChatRaw.git
@@ -548,6 +550,8 @@ docker compose up -d
 macOS 应用会自动启动本地后端，并在原生桌面窗口中打开 ChatRaw。数据保存在应用的本地 Application Support 目录中，而不是 Docker 卷中。
 
 本地开发时可使用：
+
+**开发环境要求**：Xcode Command Line Tools 或 SwiftPM，以及 Python 3.11+
 
 ```bash
 # 克隆仓库
