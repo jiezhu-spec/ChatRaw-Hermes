@@ -24,17 +24,20 @@ private struct WebView: NSViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.allowsBackForwardNavigationGestures = true
         webView.uiDelegate = context.coordinator
+        context.coordinator.loadedURL = url
         webView.load(URLRequest(url: url))
         return webView
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
-        if webView.url != url {
-            webView.load(URLRequest(url: url))
-        }
+        guard context.coordinator.loadedURL != url else { return }
+        context.coordinator.loadedURL = url
+        webView.load(URLRequest(url: url))
     }
 
     final class Coordinator: NSObject, WKUIDelegate {
+        var loadedURL: URL?
+
         @MainActor
         func webView(
             _ webView: WKWebView,

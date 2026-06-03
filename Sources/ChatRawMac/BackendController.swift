@@ -44,6 +44,7 @@ final class BackendController: ObservableObject, @unchecked Sendable {
         pipe = nil
 
         guard let process else { return }
+        process.terminationHandler = nil
         if process.isRunning {
             process.terminate()
         }
