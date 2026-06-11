@@ -1360,7 +1360,7 @@ function app() {
             };
         },
 
-        buildSendInterceptContext(message, activeSkillNames) {
+        buildSendInterceptContext(message, activeSkillNames, signal = this.abortController?.signal) {
             return {
                 message,
                 activeSkillNames: [...activeSkillNames],
@@ -1373,7 +1373,7 @@ function app() {
                 } : null,
                 hasImage: Boolean(this.uploadedImageBase64),
                 currentChatId: this.currentChatId,
-                signal: this.abortController?.signal
+                signal
             };
         },
 
@@ -1494,18 +1494,22 @@ function app() {
         // Send message
         async sendMessage() {
             if (this.isGenerating) return;
-            const outgoing = await this.prepareOutgoingMessage();
-            let message = outgoing.message;
-            const activeSkillNames = [...outgoing.activeSkillNames];
-            if (!message) return;
-            
             this.isGenerating = true;
-            this.abortController = new AbortController();
+            const sendController = new AbortController();
+            this.abortController = sendController;
             
             try {
+                const outgoing = await this.prepareOutgoingMessage();
+                if (sendController.signal.aborted) return;
+
+                let message = outgoing.message;
+                const activeSkillNames = [...outgoing.activeSkillNames];
+                if (!message) return;
+
                 const interceptResult = await this.callSendInterceptors(
-                    this.buildSendInterceptContext(message, activeSkillNames)
+                    this.buildSendInterceptContext(message, activeSkillNames, sendController.signal)
                 );
+                if (sendController.signal.aborted) return;
                 if (interceptResult?.success && interceptResult.handled) {
                     this.applySendInterceptResult(interceptResult, message);
                     return;
@@ -1517,6 +1521,7 @@ function app() {
 
                 // Call transform_input hooks to allow plugins to modify the input
                 const transformResult = await this.callHook('transform_input', message);
+                if (sendController.signal.aborted) return;
                 if (transformResult?.success && transformResult.content) {
                     message = transformResult.content;
                 }
@@ -1556,6 +1561,7 @@ function app() {
                 
                 // Call before_send hooks to allow plugins to modify the request
                 const beforeSendResult = await this.callHook('before_send', body);
+                if (sendController.signal.aborted) return;
                 if (beforeSendResult?.success && beforeSendResult.body) {
                     body = { ...body, ...beforeSendResult.body };
                 }
@@ -1566,15 +1572,16 @@ function app() {
                 }
 
                 const endpoint = await this.resolveMessageRouteEndpoint(body);
+                if (sendController.signal.aborted) return;
                 
                 this.removeUploadedImage();
                 this.removeParsedUrl();
                 this.removeAttachedDocument();
                 
                 if (this.settings.chat_settings.stream) {
-                    await this.handleStreamResponse(body, endpoint);
+                    await this.handleStreamResponse(body, endpoint, sendController.signal);
                 } else {
-                    await this.handleNormalResponse(body, endpoint);
+                    await this.handleNormalResponse(body, endpoint, sendController.signal);
                 }
                 // Call after_receive hooks for post-processing
                 const lastMsg = this.messages[this.messages.length - 1];
@@ -1596,19 +1603,23 @@ function app() {
                     this.showToast(this.t('sendFailed') + ': ' + e.message, 'error');
                 }
             } finally {
-                this.isGenerating = false;
-                this.abortController = null;
+                if (this.abortController === sendController) {
+                    this.abortController = null;
+                    this.isGenerating = false;
+                } else if (this.abortController === null) {
+                    this.isGenerating = false;
+                }
             }
         },
         
         // Handle stream response (NDJSON format) - TRUE STREAMING
-        async handleStreamResponse(body, endpoint = DEFAULT_CHAT_ENDPOINT) {
+        async handleStreamResponse(body, endpoint = DEFAULT_CHAT_ENDPOINT, signal = this.abortController?.signal) {
             const chatEndpoint = this.normalizeChatEndpoint(endpoint);
             const res = await fetch(chatEndpoint, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
-                signal: this.abortController?.signal
+                signal
             });
             
             if (!res.ok) {
@@ -1693,13 +1704,13 @@ function app() {
         },
         
         // Handle normal response
-        async handleNormalResponse(body, endpoint = DEFAULT_CHAT_ENDPOINT) {
+        async handleNormalResponse(body, endpoint = DEFAULT_CHAT_ENDPOINT, signal = this.abortController?.signal) {
             const chatEndpoint = this.normalizeChatEndpoint(endpoint);
             const res = await fetch(chatEndpoint, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
-                signal: this.abortController?.signal
+                signal
             });
             
             const data = await res.json();
