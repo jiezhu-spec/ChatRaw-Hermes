@@ -68,6 +68,15 @@ The main responsibilities are:
 | Hermes CLI bridge | Long-lived gateway, `/v1/runs`, non-interactive prompt wrapper, event normalization, tool result sync. |
 | Hermes CLI / TUI gateway | Planning, skills, terminal/search/process tools, approvals, memory, `state.db`. |
 
+## MCP Cooperation
+
+ChatRaw-Hermes uses `/v1/runs` as the main chat transport between ChatRaw and Hermes. MCP is still an important cooperation layer inside the Hermes ecosystem, and there are two supported directions:
+
+1. **Hermes as an MCP Server**: start Hermes with `hermes mcp serve`. Other MCP-capable tools can connect to Hermes and use the capabilities that Hermes exposes.
+2. **Hermes as an MCP Client**: add external MCP servers with `hermes mcp add`. Hermes imports those servers' tools and can call them during the CLI agent run. ChatRaw then receives those tool activities through the Hermes run event stream and shows them in tool activity.
+
+This means ChatRaw does not need to become an MCP client itself for the main chat path. ChatRaw only needs to preserve the Hermes run/session chain and render the tool events that Hermes emits, whether those tools are native Hermes tools, skills, or MCP-imported tools.
+
 ## Runs Mode Behavior
 
 In `runs` mode:
@@ -287,6 +296,15 @@ Hermes Router 插件推荐配置：
 | ChatRaw 后端 | Origin 校验、Hermes 配置、远程 URL 放行、session id 映射、消息持久化。 |
 | Hermes CLI bridge | 长驻 gateway、`/v1/runs`、非交互 prompt 包装、事件归一化、工具结果补齐。 |
 | Hermes CLI / TUI gateway | 规划、技能、终端/搜索/进程工具、审批、记忆、`state.db`。 |
+
+## MCP 合作方式
+
+ChatRaw-Hermes 使用 `/v1/runs` 作为 ChatRaw 和 Hermes 之间的主聊天通道。MCP 仍然是 Hermes 生态里的重要工具协作层，方向分两类：
+
+1. **Hermes 作为 MCP Server**：通过 `hermes mcp serve` 启动。其他支持 MCP 的工具可以连接到 Hermes，使用 Hermes 暴露出来的能力。
+2. **Hermes 作为 MCP Client**：通过 `hermes mcp add` 添加外部 MCP Server。Hermes 会把这些服务器的工具引入自己的 CLI agent 运行环境，在执行任务时调用。ChatRaw 再通过 Hermes run event stream 收到这些工具活动，并在 tool activity 中显示。
+
+这意味着 ChatRaw 的主链路不需要自己变成 MCP Client。ChatRaw 需要做的是保持 Hermes run/session 链路稳定，并正确展示 Hermes 发出的工具事件；这些工具可以是 Hermes 原生工具、skill，也可以是 MCP 引入的外部工具。
 
 ## runs 模式如何工作
 

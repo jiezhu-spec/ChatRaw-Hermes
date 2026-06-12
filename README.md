@@ -27,6 +27,8 @@
 
 This fork turns ChatRaw into a web front end for the **Hermes CLI agent**. The browser still uses the ChatRaw chat UI, message history, markdown rendering, plugin panel, and tool activity display, while selected messages are routed through the backend to a persistent Hermes CLI bridge.
 
+The main ChatRaw-to-Hermes chat path uses the Hermes bridge `/v1/runs` API. MCP remains part of the Hermes cooperation model: Hermes can serve capabilities to other MCP clients with `hermes mcp serve`, or import external MCP server tools with `hermes mcp add`.
+
 Current default service layout:
 
 - ChatRaw-Hermes web UI: `http://<host>:51234/`
