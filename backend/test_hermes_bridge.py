@@ -278,6 +278,24 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         result = await main.hermes_health(JsonRequest(
             url="http://testserver/api/hermes/health",
+            headers={"referer": "http://testserver/"},
+            fetch_site=None,
+        ))
+        status, data = self.decode_result(result)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["success"])
+
+        result = await main.hermes_health(JsonRequest(
+            url="http://testserver/api/hermes/health",
+            headers={"referer": "http://evil.test/"},
+            fetch_site=None,
+        ))
+        status, data = self.decode_result(result)
+        self.assertEqual(status, 403)
+        self.assertFalse(data["success"])
+
+        result = await main.hermes_health(JsonRequest(
+            url="http://testserver/api/hermes/health",
             fetch_site="none",
         ))
         status, data = self.decode_result(result)
