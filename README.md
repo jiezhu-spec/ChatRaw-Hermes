@@ -45,8 +45,10 @@ docker compose up -d --build
 Local validation before opening a pull request:
 
 ```bash
-python -m py_compile bridge/hermes_chatraw_bridge.py backend/main.py
-python -m unittest backend.test_hermes_bridge
+python3 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements.txt
+.venv/bin/python -m py_compile bridge/hermes_chatraw_bridge.py backend/main.py
+.venv/bin/python -m unittest backend.test_hermes_bridge
 node --check backend/static/app.js
 docker build -t chatraw-hermes:test .
 ```

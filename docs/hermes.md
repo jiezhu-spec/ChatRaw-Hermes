@@ -121,8 +121,10 @@ This keeps the conversation readable while preserving the execution evidence nee
 Run these before opening or updating a pull request:
 
 ```bash
-python -m py_compile bridge/hermes_chatraw_bridge.py backend/main.py
-python -m unittest backend.test_hermes_bridge
+python3 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements.txt
+.venv/bin/python -m py_compile bridge/hermes_chatraw_bridge.py backend/main.py
+.venv/bin/python -m unittest backend.test_hermes_bridge
 node --check backend/static/app.js
 docker build -t chatraw-hermes:test .
 ```
@@ -322,8 +324,10 @@ ChatRaw 需要像 Hermes Client 一样显示工具活动，让用户知道当前
 提交 PR 前执行：
 
 ```bash
-python -m py_compile bridge/hermes_chatraw_bridge.py backend/main.py
-python -m unittest backend.test_hermes_bridge
+python3 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements.txt
+.venv/bin/python -m py_compile bridge/hermes_chatraw_bridge.py backend/main.py
+.venv/bin/python -m unittest backend.test_hermes_bridge
 node --check backend/static/app.js
 docker build -t chatraw-hermes:test .
 ```
