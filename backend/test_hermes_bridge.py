@@ -891,6 +891,28 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(approval["approval_required"])
         self.assertIn("approval", approval["error"])
 
+    def test_hermes_tool_event_upsert_merges_incremental_details(self):
+        tool_events = []
+        main.upsert_hermes_tool_event(tool_events, {
+            "phase": "progress",
+            "id": "call-1",
+            "name": "terminal",
+            "label": "date",
+        })
+        main.upsert_hermes_tool_event(tool_events, {
+            "phase": "complete",
+            "id": "call-1",
+            "name": "terminal",
+            "args": "date",
+            "result": {"success": True, "output": "Sat Jun 13"},
+        })
+
+        self.assertEqual(len(tool_events), 1)
+        self.assertEqual(tool_events[0]["phase"], "complete")
+        self.assertEqual(tool_events[0]["label"], "date")
+        self.assertEqual(tool_events[0]["args"], "date")
+        self.assertEqual(tool_events[0]["result"]["output"], "Sat Jun 13")
+
     async def test_hermes_runs_stream_converts_events_and_saves(self):
         self.enable_hermes(api_mode=main.HERMES_API_MODE_RUNS)
         self.configure_chat(stream=True)
@@ -898,6 +920,7 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
             b'event: message.delta\ndata: {"delta":"Hello "}\n\n',
             b'event: message.delta\ndata: {"delta":{"reasoning_content":"Plan"}}\n\n',
             b'event: tool.progress\ndata: {"name":"terminal","tool_id":"call-1","message":"date"}\n\n',
+            b'event: tool.complete\ndata: {"name":"terminal","tool_id":"call-1","arguments":"date","result":{"success":true,"output":"Sat Jun 13"}}\n\n',
             b'data: {"output_text":"world"}\n\n',
             b'event: run.completed\ndata: {}\n\n',
         ]
@@ -922,6 +945,8 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_chunks[0]["name"], "terminal")
         self.assertEqual(tool_chunks[0]["id"], "call-1")
         self.assertEqual(tool_chunks[0]["label"], "date")
+        self.assertEqual(tool_chunks[1]["phase"], "complete")
+        self.assertEqual(tool_chunks[1]["result"]["output"], "Sat Jun 13")
         self.assertTrue(any('"done": true' in chunk for chunk in stream_chunks))
 
         chat_id = json.loads(stream_chunks[0])["chat_id"]
@@ -932,11 +957,15 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         messages = main.db.get_messages(chat_id)
         self.assertEqual(messages[1].content, "Hello world")
         self.assertEqual(messages[1].thinking, "Plan")
-        self.assertEqual(messages[1].tool_calls[0]["phase"], "progress")
+        self.assertEqual(len(messages[1].tool_calls), 1)
+        self.assertEqual(messages[1].tool_calls[0]["phase"], "complete")
         self.assertEqual(messages[1].tool_calls[0]["name"], "terminal")
+        self.assertEqual(messages[1].tool_calls[0]["label"], "date")
+        self.assertEqual(messages[1].tool_calls[0]["result"]["output"], "Sat Jun 13")
         api_messages = await main.get_messages(chat_id)
         self.assertEqual(api_messages[1]["content"], "Hello world")
         self.assertEqual(api_messages[1]["thinking"], "Plan")
+        self.assertEqual(len(api_messages[1]["toolCalls"]), 1)
         self.assertEqual(api_messages[1]["toolCalls"][0]["name"], "terminal")
 
     async def test_hermes_runs_non_stream_aggregates_events_and_saves(self):

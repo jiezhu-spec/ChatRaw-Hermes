@@ -4474,6 +4474,31 @@ def _normalize_hermes_tool_event(data: dict, event_type: str, status: str) -> di
     }
 
 
+def _merge_hermes_tool_event(existing: dict, incoming: dict) -> dict:
+    merged = {**existing, **incoming}
+    if not incoming.get("label") and existing.get("label"):
+        merged["label"] = existing["label"]
+    if incoming.get("args") in (None, "") and existing.get("args") not in (None, ""):
+        merged["args"] = existing["args"]
+    if incoming.get("result") in (None, "") and existing.get("result") not in (None, ""):
+        merged["result"] = existing["result"]
+    if incoming.get("raw") and existing.get("raw"):
+        merged["raw"] = {**existing["raw"], **incoming["raw"]}
+    return merged
+
+
+def upsert_hermes_tool_event(tool_events: List[dict], tool_event: dict) -> None:
+    if not isinstance(tool_event, dict):
+        return
+    tool_id = str(tool_event.get("id") or "")
+    if tool_id:
+        for index, existing in enumerate(tool_events):
+            if str(existing.get("id") or "") == tool_id:
+                tool_events[index] = _merge_hermes_tool_event(existing, tool_event)
+                return
+    tool_events.append(tool_event)
+
+
 def normalize_hermes_run_event(event: dict) -> dict:
     if not isinstance(event, dict):
         return {}
@@ -4642,7 +4667,7 @@ async def _consume_hermes_run(submission: dict, config: dict, request: Request, 
 
             tool_event = event.get("tool_event")
             if tool_event:
-                tool_events.append(tool_event)
+                upsert_hermes_tool_event(tool_events, tool_event)
                 if stream:
                     yield json.dumps({"tool": tool_event})
 
