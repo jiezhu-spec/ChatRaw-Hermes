@@ -40,3 +40,4 @@ package-lock.json
 
 # Local documentation
 FIX_SUMMARY.md
+.codex-remote-snapshots/
