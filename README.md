@@ -23,6 +23,40 @@
 
 ---
 
+## ChatRaw-Hermes
+
+This fork turns ChatRaw into a web front end for the **Hermes CLI agent**. The browser still uses the ChatRaw chat UI, message history, markdown rendering, plugin panel, and tool activity display, while selected messages are routed through the backend to a persistent Hermes CLI bridge.
+
+Current default service layout:
+
+- ChatRaw-Hermes web UI: `http://<host>:51234/`
+- Hermes CLI bridge: `http://<host>:51113/v1`
+- Default Docker Compose service: `chatraw-hermes`
+- GitHub repository: `https://github.com/jiezhu-spec/ChatRaw-Hermes.git`
+
+Quick clone and start:
+
+```bash
+git clone https://github.com/jiezhu-spec/ChatRaw-Hermes.git
+cd ChatRaw-Hermes
+docker compose up -d --build
+```
+
+Local validation before opening a pull request:
+
+```bash
+python -m py_compile bridge/hermes_chatraw_bridge.py backend/main.py
+python -m unittest backend.test_hermes_bridge
+node --check backend/static/app.js
+docker build -t chatraw-hermes:test .
+```
+
+Release packaging is handled by GitHub Actions. Push a version tag such as `v0.1.0` to build and publish `ghcr.io/jiezhu-spec/chatraw-hermes:<version>` and `ghcr.io/jiezhu-spec/chatraw-hermes:latest`.
+
+Full Hermes CLI front-end architecture, configuration, testing, packaging, and GitHub workflow notes are in [docs/hermes.md](docs/hermes.md).
+
+---
+
 # English
 
 ## Interface Preview
