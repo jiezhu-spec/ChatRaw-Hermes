@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -651,10 +652,13 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         messages = main.db.get_messages(data["chat_id"])
         self.assertEqual(messages[0].role, "user")
         self.assertEqual(messages[0].content, "hello hermes")
-        self.assertEqual(
-            messages[1].content,
-            "<thinking>\nprivate thought\n</thinking>\n\nassistant answer",
-        )
+        self.assertEqual(messages[1].content, "assistant answer")
+        self.assertEqual(messages[1].thinking, "private thought")
+        self.assertEqual(messages[1].tool_calls, [])
+        api_messages = await main.get_messages(data["chat_id"])
+        self.assertEqual(api_messages[1]["content"], "assistant answer")
+        self.assertEqual(api_messages[1]["thinking"], "private thought")
+        self.assertEqual(api_messages[1]["toolCalls"], [])
         chats = main.db.get_chats()
         self.assertEqual(chats[0].title, "hello hermes")
 
@@ -726,6 +730,7 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["thinking"], "")
         messages = main.db.get_messages(data["chat_id"])
         self.assertEqual(messages[1].content, "assistant answer")
+        self.assertEqual(messages[1].thinking, "")
 
     async def test_missing_api_mode_defaults_to_chat_completions_without_run(self):
         self.enable_hermes()
@@ -812,7 +817,8 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         chat_id = json.loads(stream_chunks[0])["chat_id"]
         self.assertEqual(fake_session.posts[0]["headers"]["X-Hermes-Session-Id"], f"chatraw-{chat_id}")
         messages = main.db.get_messages(chat_id)
-        self.assertEqual(messages[1].content, "<thinking>\n想\n</thinking>\n\n你")
+        self.assertEqual(messages[1].content, "你")
+        self.assertEqual(messages[1].thinking, "想")
 
     def test_hermes_run_event_parser_maps_supported_fields_and_tools(self):
         self.assertEqual(
@@ -906,7 +912,14 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_session.posts[0]["headers"]["X-Hermes-Session-Id"], f"chatraw-{chat_id}")
         self.assertEqual(fake_session.gets[0]["headers"]["X-Hermes-Session-Id"], f"chatraw-{chat_id}")
         messages = main.db.get_messages(chat_id)
-        self.assertEqual(messages[1].content, "<thinking>\nPlan\n</thinking>\n\nHello world")
+        self.assertEqual(messages[1].content, "Hello world")
+        self.assertEqual(messages[1].thinking, "Plan")
+        self.assertEqual(messages[1].tool_calls[0]["phase"], "progress")
+        self.assertEqual(messages[1].tool_calls[0]["name"], "terminal")
+        api_messages = await main.get_messages(chat_id)
+        self.assertEqual(api_messages[1]["content"], "Hello world")
+        self.assertEqual(api_messages[1]["thinking"], "Plan")
+        self.assertEqual(api_messages[1]["toolCalls"][0]["name"], "terminal")
 
     async def test_hermes_runs_non_stream_aggregates_events_and_saves(self):
         self.enable_hermes(api_mode=main.HERMES_API_MODE_RUNS)
@@ -937,7 +950,66 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_session.posts[0]["url"], "http://127.0.0.1:8642/v1/runs")
         self.assertEqual(fake_session.gets[0]["url"], "http://127.0.0.1:8642/v1/runs/run-2/events")
         messages = main.db.get_messages(data["chat_id"])
-        self.assertEqual(messages[1].content, "<thinking>\nReason\n</thinking>\n\nFinal answer")
+        self.assertEqual(messages[1].content, "Final answer")
+        self.assertEqual(messages[1].thinking, "Reason")
+        self.assertEqual(messages[1].tool_calls[0]["name"], "skill_view")
+
+    def test_message_metadata_migration_reads_legacy_thinking_without_context_leak(self):
+        tmpdir = tempfile.mkdtemp(prefix="chatraw-legacy-db-")
+        try:
+            db_path = os.path.join(tmpdir, "chatraw.db")
+            conn = sqlite3.connect(db_path)
+            conn.executescript("""
+                CREATE TABLE chats (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    created_at TEXT,
+                    updated_at TEXT
+                );
+                CREATE TABLE messages (
+                    id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT
+                );
+            """)
+            conn.execute(
+                "INSERT INTO chats (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                ("legacy-chat", "Legacy", "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO messages (id, chat_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    "legacy-msg",
+                    "legacy-chat",
+                    "assistant",
+                    "<thinking>\nold private thought\n</thinking>\n\nold visible answer",
+                    "2026-01-01T00:00:01",
+                ),
+            )
+            conn.commit()
+            conn.close()
+
+            legacy_db = main.Database(db_path)
+            try:
+                columns = {
+                    row["name"]
+                    for row in legacy_db.get_conn().execute("PRAGMA table_info(messages)").fetchall()
+                }
+                self.assertIn("thinking", columns)
+                self.assertIn("tool_calls", columns)
+                messages = legacy_db.get_messages("legacy-chat")
+                self.assertEqual(messages[0].content, "old visible answer")
+                self.assertEqual(messages[0].thinking, "old private thought")
+                self.assertEqual(messages[0].tool_calls, [])
+                service = main.LLMService(legacy_db)
+                model_messages = service.build_history_messages("legacy-chat", use_compaction=False)
+                self.assertEqual(model_messages, [{"role": "assistant", "content": "old visible answer"}])
+            finally:
+                legacy_db.get_conn().close()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     async def test_hermes_runs_approval_returns_clear_error_without_final_content(self):
         self.enable_hermes(api_mode=main.HERMES_API_MODE_RUNS)

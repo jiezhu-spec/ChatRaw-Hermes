@@ -98,7 +98,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import sqlite3
 import math
 from collections import defaultdict
@@ -223,9 +223,39 @@ class Message(BaseModel):
     chat_id: str
     role: str
     content: str
+    thinking: str = ""
+    tool_calls: List[dict] = Field(default_factory=list)
     created_at: str
 
 # ============ Database ============
+
+LEGACY_THINKING_RE = re.compile(r"^\s*<thinking>\n?(.*?)\n?</thinking>\n\n?(.*)$", re.DOTALL)
+
+
+def split_legacy_thinking_content(content: str) -> Tuple[str, str]:
+    if not content:
+        return "", ""
+    match = LEGACY_THINKING_RE.match(content)
+    if not match:
+        return content, ""
+    return match.group(2), match.group(1)
+
+
+def parse_tool_calls_json(value: Any) -> List[dict]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if not isinstance(value, str):
+        return []
+    try:
+        data = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
 
 class Database:
     def __init__(self, db_path: str):
@@ -328,11 +358,24 @@ class Database:
         
         conn.commit()
         
+        self._ensure_messages_metadata_columns(conn)
+
         # Migrate old JSON embeddings to binary format
         self._migrate_embeddings(conn)
         
         # Initialize defaults
         self._init_defaults(conn)
+
+    def _ensure_messages_metadata_columns(self, conn):
+        """Add structured assistant metadata columns without rewriting old message content."""
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(messages)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if "thinking" not in columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN thinking TEXT DEFAULT ''")
+        if "tool_calls" not in columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN tool_calls TEXT DEFAULT '[]'")
+        conn.commit()
     
     def _migrate_embeddings(self, conn):
         """Migrate old JSON embeddings to binary BLOB format"""
@@ -534,27 +577,62 @@ class Database:
         cursor = self.get_conn().cursor()
         cursor.execute("SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at ASC", (chat_id,))
         rows = cursor.fetchall()
-        
-        return [Message(
-            id=row["id"],
-            chat_id=row["chat_id"],
-            role=row["role"],
-            content=row["content"],
-            created_at=row["created_at"]
-        ) for row in rows]
+
+        messages = []
+        for row in rows:
+            content = row["content"] or ""
+            thinking = row["thinking"] or ""
+            if not thinking:
+                content, thinking = split_legacy_thinking_content(content)
+            messages.append(Message(
+                id=row["id"],
+                chat_id=row["chat_id"],
+                role=row["role"],
+                content=content,
+                thinking=thinking,
+                tool_calls=parse_tool_calls_json(row["tool_calls"]),
+                created_at=row["created_at"]
+            ))
+        return messages
     
-    def add_message(self, chat_id: str, role: str, content: str) -> Message:
+    def add_message(
+        self,
+        chat_id: str,
+        role: str,
+        content: str,
+        thinking: str = "",
+        tool_calls: Optional[List[dict]] = None,
+    ) -> Message:
         msg_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
+        safe_tool_calls = [item for item in (tool_calls or []) if isinstance(item, dict)]
         
         conn = self.get_conn()
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO messages (id, chat_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-                      (msg_id, chat_id, role, content, now))
+        cursor.execute("""
+            INSERT INTO messages (id, chat_id, role, content, thinking, tool_calls, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            msg_id,
+            chat_id,
+            role,
+            content or "",
+            thinking or "",
+            json.dumps(safe_tool_calls, ensure_ascii=False),
+            now,
+        ))
         cursor.execute("UPDATE chats SET updated_at = ? WHERE id = ?", (now, chat_id))
         conn.commit()
         
-        return Message(id=msg_id, chat_id=chat_id, role=role, content=content, created_at=now)
+        return Message(
+            id=msg_id,
+            chat_id=chat_id,
+            role=role,
+            content=content or "",
+            thinking=thinking or "",
+            tool_calls=safe_tool_calls,
+            created_at=now,
+        )
 
     def add_skill_activations(self, chat_id: str, message_id: str, activations: List[dict]):
         if not activations:
@@ -2224,11 +2302,27 @@ def build_effective_system_prompt(system_prompt: str, active_skill_context: str)
     )
 
 
-def save_assistant_message(db_instance: Database, chat_id: str, original_user_message: str, content: str, thinking: str = "") -> Message:
-    save_content = content or ""
-    if thinking:
-        save_content = f"<thinking>\n{thinking}\n</thinking>\n\n{save_content}"
-    message = db_instance.add_message(chat_id, "assistant", save_content)
+def serialize_message_for_api(message: Message) -> dict:
+    data = message.model_dump(exclude={"tool_calls"})
+    data["toolCalls"] = message.tool_calls
+    return data
+
+
+def save_assistant_message(
+    db_instance: Database,
+    chat_id: str,
+    original_user_message: str,
+    content: str,
+    thinking: str = "",
+    tool_calls: Optional[List[dict]] = None,
+) -> Message:
+    message = db_instance.add_message(
+        chat_id,
+        "assistant",
+        content or "",
+        thinking=thinking or "",
+        tool_calls=tool_calls or [],
+    )
 
     messages_count = len(db_instance.get_messages(chat_id))
     if messages_count <= 2:
@@ -3160,7 +3254,7 @@ async def delete_chat(chat_id: str):
 @app.get("/api/chats/{chat_id}/messages")
 async def get_messages(chat_id: str):
     messages = db.get_messages(chat_id)
-    return [m.model_dump() for m in messages]
+    return [serialize_message_for_api(m) for m in messages]
 
 @app.post("/api/chats/{chat_id}/compact")
 async def compact_chat_context(chat_id: str):
@@ -4554,8 +4648,15 @@ async def _consume_hermes_run(submission: dict, config: dict, request: Request, 
                     yield json.dumps({"content": content})
 
             if event.get("error"):
-                if full_response or full_thinking:
-                    save_assistant_message(db, submission["chat_id"], submission["message"], full_response, full_thinking)
+                if full_response or full_thinking or tool_events:
+                    save_assistant_message(
+                        db,
+                        submission["chat_id"],
+                        submission["message"],
+                        full_response,
+                        full_thinking,
+                        tool_events,
+                    )
                 if stream:
                     yield json.dumps({"error": event["error"]})
                     return
@@ -4573,8 +4674,15 @@ async def _consume_hermes_run(submission: dict, config: dict, request: Request, 
                 return
             raise HermesBridgeError(message, status_code=502)
 
-        if full_response or full_thinking:
-            save_assistant_message(db, submission["chat_id"], submission["message"], full_response, full_thinking)
+        if full_response or full_thinking or tool_events:
+            save_assistant_message(
+                db,
+                submission["chat_id"],
+                submission["message"],
+                full_response,
+                full_thinking,
+                tool_events,
+            )
         if stream and references:
             yield json.dumps({"references": references})
         if stream:
@@ -4589,12 +4697,26 @@ async def _consume_hermes_run(submission: dict, config: dict, request: Request, 
     except asyncio.CancelledError:
         if run_id:
             await _stop_hermes_run(session, submission, config, run_id)
-        if full_response or full_thinking:
-            save_assistant_message(db, submission["chat_id"], submission["message"], full_response, full_thinking)
+        if full_response or full_thinking or tool_events:
+            save_assistant_message(
+                db,
+                submission["chat_id"],
+                submission["message"],
+                full_response,
+                full_thinking,
+                tool_events,
+            )
         raise
     except HermesRunDisconnected:
-        if full_response or full_thinking:
-            save_assistant_message(db, submission["chat_id"], submission["message"], full_response, full_thinking)
+        if full_response or full_thinking or tool_events:
+            save_assistant_message(
+                db,
+                submission["chat_id"],
+                submission["message"],
+                full_response,
+                full_thinking,
+                tool_events,
+            )
         return
     except asyncio.TimeoutError:
         message = "Hermes run request timeout"
