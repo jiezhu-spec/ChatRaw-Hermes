@@ -890,6 +890,14 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         approval = main.normalize_hermes_run_event({"type": "run.requires_action"})
         self.assertTrue(approval["approval_required"])
         self.assertIn("approval", approval["error"])
+        approval_tool = main.normalize_hermes_run_event({
+            "type": "tool.complete",
+            "name": "approval",
+            "tool_id": "approval-1",
+            "result": "ChatRaw bridge auto-approved this Hermes request once.",
+        })
+        self.assertFalse(approval_tool["approval_required"])
+        self.assertEqual(approval_tool["tool_event"]["name"], "approval")
 
     def test_hermes_tool_event_upsert_merges_incremental_details(self):
         tool_events = []
@@ -912,6 +920,22 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_events[0]["label"], "date")
         self.assertEqual(tool_events[0]["args"], "date")
         self.assertEqual(tool_events[0]["result"]["output"], "Sat Jun 13")
+
+    def test_duplicate_visible_thinking_is_stripped_conservatively(self):
+        content = "我来展示一下能力。\n\n以上就是我的完整能力列表。"
+        self.assertEqual(main.sanitize_visible_duplicate_thinking(content, content), "")
+        self.assertEqual(
+            main.sanitize_visible_duplicate_thinking(
+                "第一段可见正文比较长，用来描述工具能力和本地运行环境。\n"
+                "第二段可见正文也比较长，用来描述搜索、终端和技能调用。\n"
+                "第三段可见正文继续说明，可以处理代码、文件、服务和 GitHub 项目。",
+                "第一段可见正文比较长，用来描述工具能力和本地运行环境。\n"
+                "第三段可见正文继续说明，可以处理代码、文件、服务和 GitHub 项目。",
+            ),
+            "",
+        )
+        private_thinking = "Need inspect config first, then answer from verified runtime state."
+        self.assertEqual(main.sanitize_visible_duplicate_thinking(content, private_thinking), private_thinking)
 
     async def test_hermes_runs_stream_converts_events_and_saves(self):
         self.enable_hermes(api_mode=main.HERMES_API_MODE_RUNS)
@@ -968,6 +992,28 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api_messages[1]["toolCalls"]), 1)
         self.assertEqual(api_messages[1]["toolCalls"][0]["name"], "terminal")
 
+    async def test_hermes_runs_stream_strips_duplicate_thinking_when_saved(self):
+        self.enable_hermes(api_mode=main.HERMES_API_MODE_RUNS)
+        self.configure_chat(stream=True)
+        event_chunks = [
+            b'data: {"delta":{"content":"Visible answer."}}\n\n',
+            b'data: {"delta":{"thinking":"Visible answer."}}\n\n',
+            b'event: run.completed\ndata: {}\n\n',
+        ]
+        self.patch_session(FakeHermesSession(
+            post_responses=[FakeHermesResponse(json_data={"run_id": "run-stream-clean-thinking"})],
+            get_response=FakeHermesResponse(stream_chunks=event_chunks),
+        ))
+
+        response = await main.hermes_chat(JsonRequest({"message": "run please", "use_thinking": True}))
+        stream_chunks = await self.collect_stream(response)
+        chat_id = json.loads(stream_chunks[0])["chat_id"]
+
+        self.assertTrue(any('"thinking": "Visible answer."' in chunk for chunk in stream_chunks))
+        messages = main.db.get_messages(chat_id)
+        self.assertEqual(messages[1].content, "Visible answer.")
+        self.assertEqual(messages[1].thinking, "")
+
     async def test_hermes_runs_non_stream_aggregates_events_and_saves(self):
         self.enable_hermes(api_mode=main.HERMES_API_MODE_RUNS)
         self.configure_chat(stream=False)
@@ -1000,6 +1046,29 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[1].content, "Final answer")
         self.assertEqual(messages[1].thinking, "Reason")
         self.assertEqual(messages[1].tool_calls[0]["name"], "skill_view")
+
+    async def test_hermes_runs_non_stream_strips_visible_duplicate_thinking(self):
+        self.enable_hermes(api_mode=main.HERMES_API_MODE_RUNS)
+        self.configure_chat(stream=False)
+        event_chunks = [
+            b'data: {"delta":{"content":"Visible answer."}}\n\n',
+            b'data: {"delta":{"thinking":"Visible answer."}}\n\n',
+            b'event: run.succeeded\ndata: {}\n\n',
+        ]
+        self.patch_session(FakeHermesSession(
+            post_responses=[FakeHermesResponse(json_data={"id": "run-clean-thinking"})],
+            get_response=FakeHermesResponse(stream_chunks=event_chunks),
+        ))
+
+        result = await main.hermes_chat(JsonRequest({"message": "non stream run", "use_thinking": True}))
+        status, data = self.decode_result(result)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data["content"], "Visible answer.")
+        self.assertEqual(data["thinking"], "")
+        messages = main.db.get_messages(data["chat_id"])
+        self.assertEqual(messages[1].content, "Visible answer.")
+        self.assertEqual(messages[1].thinking, "")
 
     def test_message_metadata_migration_reads_legacy_thinking_without_context_leak(self):
         tmpdir = tempfile.mkdtemp(prefix="chatraw-legacy-db-")

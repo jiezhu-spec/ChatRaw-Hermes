@@ -2308,6 +2308,43 @@ def serialize_message_for_api(message: Message) -> dict:
     return data
 
 
+def _compact_overlap_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def sanitize_visible_duplicate_thinking(content: str, thinking: str) -> str:
+    """Drop provider reasoning that is just a duplicate of the visible answer."""
+    raw_thinking = thinking or ""
+    if not raw_thinking.strip():
+        return ""
+
+    content_norm = _compact_overlap_text(content or "")
+    thinking_norm = _compact_overlap_text(raw_thinking)
+    if not content_norm or not thinking_norm:
+        return raw_thinking
+
+    if thinking_norm == content_norm or thinking_norm in content_norm:
+        return ""
+
+    thinking_lines = [
+        _compact_overlap_text(line)
+        for line in raw_thinking.splitlines()
+        if len(_compact_overlap_text(line)) >= 8
+    ]
+    if thinking_lines:
+        visible_lines = sum(1 for line in thinking_lines if line in content_norm)
+        if visible_lines / len(thinking_lines) >= 0.6:
+            return ""
+
+    if len(thinking_norm) >= 80:
+        prefix = thinking_norm[:160]
+        suffix = thinking_norm[-160:]
+        if prefix in content_norm and suffix in content_norm:
+            return ""
+
+    return raw_thinking
+
+
 def save_assistant_message(
     db_instance: Database,
     chat_id: str,
@@ -2316,11 +2353,12 @@ def save_assistant_message(
     thinking: str = "",
     tool_calls: Optional[List[dict]] = None,
 ) -> Message:
+    clean_thinking = sanitize_visible_duplicate_thinking(content or "", thinking or "")
     message = db_instance.add_message(
         chat_id,
         "assistant",
         content or "",
-        thinking=thinking or "",
+        thinking=clean_thinking,
         tool_calls=tool_calls or [],
     )
 
@@ -4718,9 +4756,10 @@ async def _consume_hermes_run(submission: dict, config: dict, request: Request, 
         if stream:
             yield json.dumps({"done": True})
         else:
+            clean_thinking = sanitize_visible_duplicate_thinking(full_response, full_thinking)
             yield json.dumps({
                 "content": full_response,
-                "thinking": full_thinking,
+                "thinking": clean_thinking,
                 "references": references,
                 "tools": tool_events,
             })
@@ -4811,6 +4850,7 @@ async def _call_hermes_non_stream(submission: dict, config: dict) -> dict:
 
     content = _extract_openai_content(message)
     thinking = _extract_openai_thinking(message) if submission["use_thinking"] else ""
+    thinking = sanitize_visible_duplicate_thinking(content, thinking)
     save_assistant_message(db, submission["chat_id"], submission["message"], content, thinking)
     return {"content": content, "thinking": thinking, "references": references}
 

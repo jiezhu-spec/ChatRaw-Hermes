@@ -38,19 +38,31 @@ RPC_TIMEOUT_SECONDS = float(os.environ.get("HERMES_GATEWAY_RPC_TIMEOUT", "120"))
 TURN_TIMEOUT_SECONDS = float(os.environ.get("HERMES_GATEWAY_TURN_TIMEOUT", str(60 * 60)))
 RUN_TTL_SECONDS = float(os.environ.get("HERMES_BRIDGE_RUN_TTL", "1800"))
 IDLE_GATEWAY_SECONDS = float(os.environ.get("HERMES_BRIDGE_GATEWAY_TTL", "900"))
-NONINTERACTIVE_INSTRUCTION = os.environ.get(
-    "HERMES_BRIDGE_NONINTERACTIVE_INSTRUCTION",
-    (
-        "System note for ChatRaw bridge: this request is non-interactive. "
-        "Do not use clarify or ask follow-up questions. If details are missing, "
-        "make a reasonable assumption and proceed. Prefer bounded commands and "
-        "concise summaries. Runtime context: this bridge runs on the RM01 host "
-        "10.10.99.99 as user rm01. When the user asks about the 99 server, "
-        "inspect this local host directly unless the user explicitly asks for SSH."
-    ),
+DEFAULT_NONINTERACTIVE_INSTRUCTION = (
+    "System note for ChatRaw bridge: this request is non-interactive. "
+    "Do not use clarify or ask follow-up questions. If details are missing, "
+    "make a reasonable assumption and proceed. Prefer bounded commands and "
+    "concise summaries. Runtime context: this bridge runs on the RM01 host "
+    "10.10.99.99 as user rm01. When the user asks about the 99 server, "
+    "inspect this local host directly unless the user explicitly asks for SSH."
+)
+CAPABILITY_SELF_DESCRIPTION_INSTRUCTION = (
+    "When the user asks about your capabilities, skills, tools, or what you "
+    "can do, answer from the local runtime and available tool context; do not "
+    "call web_search unless the user explicitly asks for current external "
+    "information."
+)
+NONINTERACTIVE_INSTRUCTION = "\n".join(
+    part
+    for part in (
+        os.environ.get("HERMES_BRIDGE_NONINTERACTIVE_INSTRUCTION", DEFAULT_NONINTERACTIVE_INSTRUCTION),
+        CAPABILITY_SELF_DESCRIPTION_INSTRUCTION,
+    )
+    if part
 )
 TOOL_ARGS_CAP = int(os.environ.get("HERMES_BRIDGE_TOOL_ARGS_CAP", "4000"))
 TOOL_RESULT_CAP = int(os.environ.get("HERMES_BRIDGE_TOOL_RESULT_CAP", "12000"))
+AUTO_APPROVE_LABEL = "ChatRaw bridge auto-approved this Hermes request once."
 
 
 app = FastAPI(title="Hermes ChatRaw Structured Bridge")
@@ -475,9 +487,10 @@ async def _run_gateway_turn(run: RunState) -> None:
     completion = asyncio.get_running_loop().create_future()
     sent_text = False
     saw_reasoning_delta = False
+    approval_count = 0
 
     async def handle_gateway_event(event: Dict[str, Any]) -> None:
-        nonlocal sent_text, saw_reasoning_delta
+        nonlocal sent_text, saw_reasoning_delta, approval_count
         if event.get("session_id") != run.gateway_session_id:
             return
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
@@ -516,13 +529,51 @@ async def _run_gateway_turn(run: RunState) -> None:
                 }
             )
         elif event_type == "approval.request":
-            asyncio.create_task(
-                gateway.request(
-                    "approval.respond",
-                    {"session_id": run.gateway_session_id, "choice": "once"},
-                    timeout=15,
-                )
+            approval_count += 1
+            tool_id = _as_text(payload.get("tool_id")) or f"approval-{run.run_id}-{approval_count}"
+            reason = (
+                _as_text(payload.get("reason"))
+                or _as_text(payload.get("message"))
+                or _as_text(payload.get("summary"))
+                or "Hermes requested approval"
             )
+            await run.put(
+                {
+                    "type": "tool.start",
+                    "tool_id": tool_id,
+                    "name": "approval",
+                    "context": f"{reason} ({AUTO_APPROVE_LABEL})",
+                }
+            )
+            await run.put(
+                {
+                    "type": "tool.complete",
+                    "tool_id": tool_id,
+                    "name": "approval",
+                    "summary": AUTO_APPROVE_LABEL,
+                    "result": AUTO_APPROVE_LABEL,
+                }
+            )
+
+            async def approve_once() -> None:
+                try:
+                    await gateway.request(
+                        "approval.respond",
+                        {"session_id": run.gateway_session_id, "choice": "once"},
+                        timeout=15,
+                    )
+                except Exception as exc:
+                    await run.put(
+                        {
+                            "type": "tool.error",
+                            "tool_id": tool_id,
+                            "name": "approval",
+                            "summary": f"Approval failed: {exc}",
+                            "result": str(exc),
+                        }
+                    )
+
+            asyncio.create_task(approve_once())
         elif event_type == "message.complete":
             text = _as_text(payload.get("text"))
             status = _as_text(payload.get("status")) or "complete"
