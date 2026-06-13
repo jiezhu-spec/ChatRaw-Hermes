@@ -44,7 +44,13 @@ DEFAULT_NONINTERACTIVE_INSTRUCTION = (
     "make a reasonable assumption and proceed. Prefer bounded commands and "
     "concise summaries. Runtime context: this bridge runs on the RM01 host "
     "10.10.99.99 as user rm01. When the user asks about the 99 server, "
-    "inspect this local host directly unless the user explicitly asks for SSH."
+    "inspect this local host directly unless the user explicitly asks for SSH. "
+    "For long-running operations such as docker compose pull/up/build, npm install, "
+    "pip install, model downloads, large builds, package managers, or server/watch "
+    "processes, start the operation in the background with output redirected to a "
+    "clear log file, return the PID/job id and log path, then poll readiness with "
+    "short bounded commands such as ps, tail -20, curl health checks, or docker ps. "
+    "Do not keep a foreground terminal call waiting for the whole long operation."
 )
 CAPABILITY_SELF_DESCRIPTION_INSTRUCTION = (
     "When the user asks about your capabilities, skills, tools, or what you "

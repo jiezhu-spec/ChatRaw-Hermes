@@ -992,6 +992,35 @@ class HermesBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api_messages[1]["toolCalls"]), 1)
         self.assertEqual(api_messages[1]["toolCalls"][0]["name"], "terminal")
 
+    async def test_hermes_runs_event_timeout_uses_configured_value(self):
+        self.enable_hermes(api_mode=main.HERMES_API_MODE_RUNS)
+        self.configure_chat(stream=True)
+        original_timeout = main.HERMES_RUN_EVENT_TIMEOUT_SECONDS
+        main.HERMES_RUN_EVENT_TIMEOUT_SECONDS = 1234
+        self.addCleanup(lambda: setattr(main, "HERMES_RUN_EVENT_TIMEOUT_SECONDS", original_timeout))
+        fake_session = self.patch_session(FakeHermesSession(
+            post_responses=[FakeHermesResponse(json_data={"run_id": "run-timeout-config"})],
+            get_response=FakeHermesResponse(stream_chunks=[
+                b'event: run.completed\ndata: {}\n\n',
+            ]),
+        ))
+
+        response = await main.hermes_chat(JsonRequest({"message": "run timeout config"}))
+        await self.collect_stream(response)
+
+        self.assertEqual(fake_session.gets[0]["timeout"].total, 1234)
+        self.assertEqual(fake_session.gets[0]["timeout"].connect, main.HERMES_RUN_CONNECT_TIMEOUT_SECONDS)
+
+    def test_bridge_instruction_backgrounds_long_commands(self):
+        bridge_path = os.path.join(REPO_ROOT, "bridge", "hermes_chatraw_bridge.py")
+        with open(bridge_path, "r", encoding="utf-8") as f:
+            source = f.read()
+
+        self.assertIn("long-running operations", source)
+        self.assertIn("docker compose pull/up/build", source)
+        self.assertIn("start the operation in the background", source)
+        self.assertIn("tail -20", source)
+
     async def test_hermes_runs_stream_strips_duplicate_thinking_when_saved(self):
         self.enable_hermes(api_mode=main.HERMES_API_MODE_RUNS)
         self.configure_chat(stream=True)

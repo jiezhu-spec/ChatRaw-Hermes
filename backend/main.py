@@ -135,6 +135,30 @@ def bytes_to_embedding(data: bytes) -> List[float]:
 
 _http_session: Optional[aiohttp.ClientSession] = None
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(f"Ignoring invalid {name}={raw!r}; using {default}")
+        return default
+    if value <= 0:
+        logger.warning(f"Ignoring non-positive {name}={raw!r}; using {default}")
+        return default
+    return value
+
+HERMES_DEFAULT_TIMEOUT_SECONDS = _env_float("HERMES_HTTP_TIMEOUT", 300)
+HERMES_CHAT_TIMEOUT_SECONDS = _env_float("HERMES_CHAT_TIMEOUT", HERMES_DEFAULT_TIMEOUT_SECONDS)
+HERMES_RUN_CREATE_TIMEOUT_SECONDS = _env_float("HERMES_RUN_CREATE_TIMEOUT", 60)
+HERMES_RUN_STOP_TIMEOUT_SECONDS = _env_float("HERMES_RUN_STOP_TIMEOUT", 30)
+HERMES_RUN_EVENT_TIMEOUT_SECONDS = _env_float(
+    "HERMES_RUN_EVENT_TIMEOUT",
+    _env_float("HERMES_BRIDGE_TIMEOUT", 1800),
+)
+HERMES_RUN_CONNECT_TIMEOUT_SECONDS = _env_float("HERMES_RUN_CONNECT_TIMEOUT", 10)
+
 def _create_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
@@ -142,7 +166,7 @@ async def get_http_session() -> aiohttp.ClientSession:
     """Get or create shared HTTP session"""
     global _http_session
     if _http_session is None or _http_session.closed:
-        timeout = aiohttp.ClientTimeout(total=300, connect=10)
+        timeout = aiohttp.ClientTimeout(total=HERMES_DEFAULT_TIMEOUT_SECONDS, connect=10)
         connector = aiohttp.TCPConnector(ssl=_create_ssl_context())
         _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
     return _http_session
@@ -4610,7 +4634,10 @@ async def _create_hermes_run(session, submission: dict, config: dict) -> Tuple[s
         f"{config['base_url']}/runs",
         json=payload,
         headers=_hermes_chat_headers(config, submission["chat_id"]),
-        timeout=aiohttp.ClientTimeout(total=60, connect=10),
+        timeout=aiohttp.ClientTimeout(
+            total=HERMES_RUN_CREATE_TIMEOUT_SECONDS,
+            connect=HERMES_RUN_CONNECT_TIMEOUT_SECONDS,
+        ),
         allow_redirects=False,
     ) as resp:
         if resp.status < 200 or resp.status >= 300:
@@ -4642,7 +4669,7 @@ async def _stop_hermes_run(session, submission: dict, config: dict, run_id: str)
             f"{config['base_url']}/runs/{run_id}/stop",
             json={},
             headers=_hermes_chat_headers(config, submission["chat_id"]),
-            timeout=aiohttp.ClientTimeout(total=30, connect=5),
+            timeout=aiohttp.ClientTimeout(total=HERMES_RUN_STOP_TIMEOUT_SECONDS, connect=5),
             allow_redirects=False,
         ) as resp:
             if resp.status >= 400:
@@ -4656,7 +4683,10 @@ async def _iter_hermes_run_events(session, submission: dict, config: dict, reque
     async with session.get(
         f"{config['base_url']}/runs/{run_id}/events",
         headers=_hermes_chat_headers(config, submission["chat_id"]),
-        timeout=aiohttp.ClientTimeout(total=300, connect=10),
+        timeout=aiohttp.ClientTimeout(
+            total=HERMES_RUN_EVENT_TIMEOUT_SECONDS,
+            connect=HERMES_RUN_CONNECT_TIMEOUT_SECONDS,
+        ),
         allow_redirects=False,
     ) as resp:
         if resp.status != 200:
@@ -4831,7 +4861,7 @@ async def _call_hermes_non_stream(submission: dict, config: dict) -> dict:
             f"{config['base_url']}/chat/completions",
             json=payload,
             headers=_hermes_chat_headers(config, submission["chat_id"]),
-            timeout=aiohttp.ClientTimeout(total=300, connect=10),
+            timeout=aiohttp.ClientTimeout(total=HERMES_CHAT_TIMEOUT_SECONDS, connect=10),
             allow_redirects=False,
         ) as resp:
             if resp.status != 200:
@@ -4956,7 +4986,7 @@ async def _stream_hermes_chat_chunks(submission: dict, config: dict) -> AsyncGen
             f"{config['base_url']}/chat/completions",
             json=payload,
             headers=_hermes_chat_headers(config, submission["chat_id"]),
-            timeout=aiohttp.ClientTimeout(total=300, connect=10),
+            timeout=aiohttp.ClientTimeout(total=HERMES_CHAT_TIMEOUT_SECONDS, connect=10),
             allow_redirects=False,
         ) as resp:
             if resp.status != 200:

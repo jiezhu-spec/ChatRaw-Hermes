@@ -44,6 +44,18 @@ Configure the Hermes Router plugin with:
 
 For non-loopback Base URLs, add the exact URL to **Allowed remote base URLs**, review and confirm the warning, save settings, then click **Check**.
 
+## Timeout And Long Jobs
+
+`runs` mode keeps an HTTP/SSE connection open while Hermes emits events. The run event timeout is configurable:
+
+```bash
+HERMES_RUN_EVENT_TIMEOUT=1800
+```
+
+If `HERMES_RUN_EVENT_TIMEOUT` is not set, ChatRaw falls back to `HERMES_BRIDGE_TIMEOUT` when present, then to `1800` seconds. Related knobs are `HERMES_RUN_CREATE_TIMEOUT`, `HERMES_RUN_STOP_TIMEOUT`, `HERMES_RUN_CONNECT_TIMEOUT`, `HERMES_CHAT_TIMEOUT`, and `HERMES_HTTP_TIMEOUT`.
+
+For long terminal work, prefer background execution plus log polling. Examples include `docker compose pull`, `docker compose up`, `npm install`, `pip install`, model downloads, large builds, and server/watch processes. The bridge prompt tells Hermes to start these in the background, redirect output to a clear log file, return the PID/job id and log path, then poll with bounded commands such as `ps`, `tail -20`, `curl` health checks, or `docker ps`.
+
 ## Data Chain
 
 The runtime chain is:
@@ -274,6 +286,18 @@ Hermes Router 插件推荐配置：
 - API Mode：`runs`
 
 如果 Base URL 是非 loopback 地址，需要写入 **允许的远程 Base URL**，确认风险，保存后再点 **检查**。
+
+## 超时和长任务
+
+`runs` 模式会在 Hermes 输出事件期间保持 HTTP/SSE 连接。run event 超时可配置：
+
+```bash
+HERMES_RUN_EVENT_TIMEOUT=1800
+```
+
+如果没有设置 `HERMES_RUN_EVENT_TIMEOUT`，ChatRaw 会兼容读取旧的 `HERMES_BRIDGE_TIMEOUT`，再退回默认 `1800` 秒。相关配置还有 `HERMES_RUN_CREATE_TIMEOUT`、`HERMES_RUN_STOP_TIMEOUT`、`HERMES_RUN_CONNECT_TIMEOUT`、`HERMES_CHAT_TIMEOUT` 和 `HERMES_HTTP_TIMEOUT`。
+
+长时间终端任务应走后台执行加日志轮询。典型任务包括 `docker compose pull`、`docker compose up`、`npm install`、`pip install`、模型下载、大型构建、server/watch 进程。bridge prompt 会要求 Hermes 后台启动任务、把输出重定向到明确的日志文件、返回 PID/job id 和日志路径，再用 `ps`、`tail -20`、`curl` 健康检查或 `docker ps` 等短命令轮询进度。
 
 ## 数据链路
 

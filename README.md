@@ -36,6 +36,8 @@ Current default service layout:
 - Default Docker Compose service: `chatraw-hermes`
 - GitHub repository: `https://github.com/jiezhu-spec/ChatRaw-Hermes.git`
 
+Hermes run event streaming defaults to `HERMES_RUN_EVENT_TIMEOUT=1800` seconds so slow tool chains do not fail at the old 300 second HTTP limit. Compose also sets matching Hermes chat/create/stop/connect timeout knobs. Long operations such as Docker pulls, package installs, model downloads, and large builds are still expected to run as background jobs with log polling instead of blocking a single foreground terminal call.
+
 Quick clone and start:
 
 ```bash
